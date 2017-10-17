@@ -312,7 +312,9 @@ void Data::asyncCallback(uv_async_t* handle)
             std::vector<v8::Local<v8::Value> > values;
             values.push_back(v8::Local<v8::Value>(v8::Integer::New(data->isolate, to_underlying(Data::Message::Type::Format))));
             values.push_back(v8::Local<v8::Value>(std::move(formatObj)));
-            callback->Call(context, callback, values.size(), &values[0]);
+            if (callback->Call(context, callback, values.size(), &values[0]).IsEmpty()) {
+                Nan::ThrowError("Failed to call");
+            }
             break; }
         case Data::Message::Type::Metadata: {
             const auto& meta = std::get<Data::Metadata>(message.data);
@@ -325,7 +327,9 @@ void Data::asyncCallback(uv_async_t* handle)
             std::vector<v8::Local<v8::Value> > values;
             values.push_back(v8::Local<v8::Value>(v8::Integer::New(data->isolate, to_underlying(Data::Message::Type::Metadata))));
             values.push_back(v8::Local<v8::Value>(std::move(metaObj)));
-            callback->Call(context, callback, values.size(), &values[0]);
+            if (callback->Call(context, callback, values.size(), &values[0]).IsEmpty()) {
+                Nan::ThrowError("Failed to call");
+            }
             break; }
         case Data::Message::Type::Data: {
             const auto& str = std::get<std::string>(message.data);
@@ -338,18 +342,24 @@ void Data::asyncCallback(uv_async_t* handle)
             std::vector<v8::Local<v8::Value> > values;
             values.push_back(v8::Local<v8::Value>(v8::Integer::New(data->isolate, to_underlying(Data::Message::Type::Data))));
             values.push_back(v8::Local<v8::Value>(std::move(bufferObj)));
-            callback->Call(context, callback, values.size(), &values[0]);
+            if (callback->Call(context, callback, values.size(), &values[0]).IsEmpty()) {
+                Nan::ThrowError("Failed to call");
+            }
             break; }
         case Data::Message::Type::Done: {
             v8::Local<v8::Value> done = v8::Integer::New(data->isolate, to_underlying(message.type));
-            callback->Call(context, callback, 1, &done);
+            if (callback->Call(context, callback, 1, &done).IsEmpty()) {
+                Nan::ThrowError("Failed to call");
+            }
             break; }
         case Data::Message::Type::End: {
             // decoder end and thread dead. join and stuff.
             data->close();
 
             v8::Local<v8::Value> end = v8::Integer::New(data->isolate, to_underlying(message.type));
-            callback->Call(context, callback, 1, &end);
+            if (callback->Call(context, callback, 1, &end).IsEmpty()) {
+                Nan::ThrowError("Failed to call");
+            }
             break; }
         }
     }
