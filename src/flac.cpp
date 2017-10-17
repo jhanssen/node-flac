@@ -99,9 +99,12 @@ Data::~Data()
 
 inline bool Data::formatChanged(const FLAC__Frame* frame) const
 {
+    uint32_t bps = frame->header.bits_per_sample;
+    if (bps == 24)
+        bps = 32;
     if (frame->header.sample_rate != currentFormat.sampleRate
         || frame->header.channels != currentFormat.channels
-        || frame->header.bits_per_sample != currentFormat.bitsPerSample)
+        || bps != currentFormat.bitsPerSample)
         return true;
     return false;
 }
@@ -110,7 +113,10 @@ inline void Data::pushFormat(const FLAC__Frame* frame)
 {
     currentFormat.sampleRate = frame->header.sample_rate;
     currentFormat.channels = frame->header.channels;
-    currentFormat.bitsPerSample = frame->header.bits_per_sample;
+    uint32_t bps = frame->header.bits_per_sample;
+    if (bps == 24)
+        bps = 32;
+    currentFormat.bitsPerSample = bps;
     messages.push_back(Message{ Message::Type::Format, currentFormat });
 }
 
@@ -158,7 +164,10 @@ FLAC__StreamDecoderWriteStatus Data::writeCallback(const FLAC__StreamDecoder *de
         data->pushFormat(frame);
         uv_async_send(&data->async);
     }
-    const uint32_t frameSamples = frame->header.blocksize * frame->header.channels * (frame->header.bits_per_sample / 8);
+    uint32_t bps = frame->header.bits_per_sample;
+    if (bps == 24)
+        bps = 32;
+    const uint32_t frameSamples = frame->header.blocksize * frame->header.channels * (bps / 8);
 
     std::string dt;
     dt.resize(frameSamples);
@@ -175,15 +184,16 @@ FLAC__StreamDecoderWriteStatus Data::writeCallback(const FLAC__StreamDecoder *de
                 *(ptr++) = buffer[j][i] >> 8;
                 break;
             case 24:
-                *(ptr++) = buffer[j][i] >> 16;
-                *(ptr++) = buffer[j][i] >> 8;
+                *(ptr++) = 0;
                 *(ptr++) = buffer[j][i];
+                *(ptr++) = buffer[j][i] >> 8;
+                *(ptr++) = buffer[j][i] >> 16;
                 break;
             case 32:
-                *(ptr++) = buffer[j][i] >> 24;
-                *(ptr++) = buffer[j][i] >> 16;
-                *(ptr++) = buffer[j][i] >> 8;
                 *(ptr++) = buffer[j][i];
+                *(ptr++) = buffer[j][i] >> 8;
+                *(ptr++) = buffer[j][i] >> 16;
+                *(ptr++) = buffer[j][i] >> 24;
                 break;
             }
         }
