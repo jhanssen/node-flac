@@ -19,19 +19,24 @@ struct Data
     static uint32_t openCount;
     static Nan::Persistent<v8::Private> extName;
 
-    bool stopped, closed;
+    bool stopped, needsDone, end;
     Nan::Persistent<v8::Context> context;
     Nan::Persistent<v8::Function> callback;
     Nan::Persistent<v8::Object> weak;
     v8::Isolate* isolate;
-    FLAC__StreamDecoder decoder;
+    FLAC__StreamDecoder* decoder;
 
     uv_async_t async;
     uv_thread_t thread;
     uv_mutex_t mutex;
     uv_cond_t cond;
 
-    std::vector<std::string> inbuffers, inlocalBuffers;
+    struct BufferData
+    {
+        size_t where;
+        std::string buffer;
+    };
+    std::vector<BufferData> inbuffers;
 
     struct Format
     {
@@ -47,7 +52,7 @@ struct Data
 
     struct Message
     {
-        enum class Type { Format, Metadata, Data };
+        enum class Type { Format, Metadata, Data, Done };
 
         Type type;
         std::variant<Format, Metadata, std::string> data;
@@ -77,7 +82,7 @@ uint32_t Data::openCount = 0;
 Nan::Persistent<v8::Private> Data::extName;
 
 Data::Data()
-    : stopped(false), closed(false)
+    : stopped(false), needsDone(false), end(false), decoder(nullptr)
 {
     memset(&currentFormat, '\0', sizeof(currentFormat));
 }
@@ -102,33 +107,47 @@ inline void Data::pushFormat(const FLAC__Frame* frame)
 FLAC__StreamDecoderReadStatus Data::readCallback(const FLAC__StreamDecoder */*decoder*/, FLAC__byte buffer[], size_t *bytes, void *client_data)
 {
     Data* data = static_cast<Data*>(client_data);
+    while (!data->stopped && data->inbuffers.empty()) {
+        // if we need more data, wait
+        if (data->needsDone) {
+            data->messages.push_back(Message{ Message::Type::Done, std::string() });
+            uv_async_send(&data->async);
+        }
+        uv_cond_wait(&data->cond, &data->mutex);
+    }
+    if (data->stopped) {
+        *bytes = 0;
+        return FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM;
+    }
+
+    data->needsDone = true;
     size_t rem = *bytes, where = 0;
-    while (rem && !data->inlocalBuffers.empty()) {
-        auto& front = data->inlocalBuffers.front();
-        const size_t toread = std::min(front.size(), rem);
-        memcpy(buffer + where, front.data(), toread);
+    while (rem && !data->inbuffers.empty()) {
+        auto& front = data->inbuffers.front();
+
+        const size_t toread = std::min(front.buffer.size() - front.where, rem);
+        memcpy(buffer + where, front.buffer.data() + front.where, toread);
         rem -= toread;
         where += toread;
-        if (toread == front.size()) {
-            data->inlocalBuffers.erase(data->inlocalBuffers.begin());
+        if (toread == front.buffer.size() - front.where) {
+            data->inbuffers.erase(data->inbuffers.begin());
+        } else {
+            front.where += toread;
         }
     }
-    if (where > 0) {
-        *bytes = where;
-        return FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
-    }
-    return FLAC__STREAM_DECODER_READ_STATUS_END_OF_STREAM;
+
+    *bytes = where;
+    return FLAC__STREAM_DECODER_READ_STATUS_CONTINUE;
 }
 
 FLAC__StreamDecoderWriteStatus Data::writeCallback(const FLAC__StreamDecoder *decoder, const FLAC__Frame *frame, const FLAC__int32 *const buffer[], void *client_data)
 {
     Data* data = static_cast<Data*>(client_data);
-    uv_mutex_lock(&data->mutex);
     if (data->formatChanged(frame)) {
         data->pushFormat(frame);
         uv_async_send(&data->async);
     }
-    const uint32_t frameSamples = frame->header.blocksize * frame->header.channels * frame->header.bits_per_sample;
+    const uint32_t frameSamples = frame->header.blocksize * frame->header.channels * (frame->header.bits_per_sample / 8);
 
     std::string dt;
     dt.resize(frameSamples);
@@ -141,33 +160,37 @@ FLAC__StreamDecoderWriteStatus Data::writeCallback(const FLAC__StreamDecoder *de
                 *(ptr++) = buffer[j][i];
                 break;
             case 16:
-                memcpy(ptr, buffer[j] + i, 2);
-                ptr += 2;
+                *(ptr++) = buffer[j][i];
+                *(ptr++) = buffer[j][i] >> 8;
                 break;
             case 24:
-                memcpy(ptr, buffer[j] + i, 3);
-                ptr += 3;
+                *(ptr++) = buffer[j][i] >> 16;
+                *(ptr++) = buffer[j][i] >> 8;
+                *(ptr++) = buffer[j][i];
                 break;
             case 32:
-                memcpy(ptr, buffer[j] + i, 4);
-                ptr += 4;
+                *(ptr++) = buffer[j][i] >> 24;
+                *(ptr++) = buffer[j][i] >> 16;
+                *(ptr++) = buffer[j][i] >> 8;
+                *(ptr++) = buffer[j][i];
                 break;
             }
         }
     }
+
+    // printf("wrote %u (%u)\n", frameSamples, ptr - reinterpret_cast<unsigned char*>(&dt[0]));
 
     if (!dt.empty()) {
         data->messages.push_back(Message{ Message::Type::Data, dt });
         uv_async_send(&data->async);
     }
 
-    uv_mutex_unlock(&data->mutex);
-
     return FLAC__STREAM_DECODER_WRITE_STATUS_CONTINUE;
 }
 
 void Data::metadataCallback(const FLAC__StreamDecoder *decoder, const FLAC__StreamMetadata *metadata, void *client_data)
 {
+    // printf("!!meta %d\n", metadata->type);
     Data* data = static_cast<Data*>(client_data);
     if (metadata->type == FLAC__METADATA_TYPE_VORBIS_COMMENT) {
         const auto& vorbis = metadata->data.vorbis_comment;
@@ -198,37 +221,22 @@ void Data::errorCallback(const FLAC__StreamDecoder *decoder, FLAC__StreamDecoder
 void Data::flacThread(void* arg)
 {
     Data* data = static_cast<Data*>(arg);
+
     uv_mutex_lock(&data->mutex);
     for (;;) {
-        uv_cond_wait(&data->cond, &data->mutex);
-        if (data->stopped) {
-            uv_mutex_unlock(&data->mutex);
-            return;
+        if (!FLAC__stream_decoder_process_single(data->decoder)) {
+            // badness, not sure what to do yet
         }
 
-        if (!data->inbuffers.empty()) {
-            data->inlocalBuffers = std::move(data->inbuffers);
-            uv_mutex_unlock(&data->mutex);
-            if (!FLAC__stream_decoder_process_until_end_of_stream(&data->decoder)) {
-                // badness, not sure what to do yet
-            }
-
-            if (!data->inlocalBuffers.empty()) {
-                // prepend to buffers
-                // if this happens often then it might be better to keep the data in localBuffers and append buffers instead
-                uv_mutex_lock(&data->mutex);
-                data->inbuffers.insert(data->inbuffers.begin(), data->inlocalBuffers.begin(), data->inlocalBuffers.end());
-                data->inlocalBuffers.clear();
-                continue;
-            }
-            uv_mutex_lock(&data->mutex);
-        }
+        if (data->stopped)
+            break;
     }
+    uv_mutex_unlock(&data->mutex);
 }
 
 void Data::close()
 {
-    if (closed)
+    if (!decoder)
         return;
 
     if (!--Data::openCount) {
@@ -246,11 +254,12 @@ void Data::close()
     context.Reset();
     callback.Reset();
 
-    FLAC__stream_decoder_finish(&decoder);
-    FLAC__stream_decoder_delete(&decoder);
+    FLAC__stream_decoder_finish(decoder);
+    FLAC__stream_decoder_delete(decoder);
     uv_cond_destroy(&cond);
     uv_mutex_destroy(&mutex);
-    closed = true;
+
+    decoder = nullptr;
 }
 
 void Data::weakCallback(const Nan::WeakCallbackInfo<Data> &data)
@@ -278,6 +287,8 @@ void Data::asyncCallback(uv_async_t* handle)
             const auto& format = std::get<Data::Format>(message.data);
             v8::Local<v8::Object> formatObj = v8::Object::New(data->isolate);
             formatObj->Set(v8::String::NewFromUtf8(data->isolate, "sampleRate"), v8::Integer::New(data->isolate, format.sampleRate));
+            formatObj->Set(v8::String::NewFromUtf8(data->isolate, "channels"), v8::Integer::New(data->isolate, format.channels));
+            formatObj->Set(v8::String::NewFromUtf8(data->isolate, "bitDepth"), v8::Integer::New(data->isolate, format.bitsPerSample));
 
             std::vector<v8::Local<v8::Value> > values;
             values.push_back(v8::Local<v8::Value>(v8::Integer::New(data->isolate, to_underlying(Data::Message::Type::Format))));
@@ -310,6 +321,10 @@ void Data::asyncCallback(uv_async_t* handle)
             values.push_back(v8::Local<v8::Value>(std::move(bufferObj)));
             callback->Call(context, callback, values.size(), &values[0]);
             break; }
+        case Data::Message::Type::Done: {
+            v8::Local<v8::Value> done = v8::Integer::New(data->isolate, to_underlying(message.type));
+            callback->Call(context, callback, 1, &done);
+            break; }
         }
     }
 }
@@ -317,7 +332,6 @@ void Data::asyncCallback(uv_async_t* handle)
 NAN_METHOD(Open) {
     Data* data = new Data;
     data->isolate = info.GetIsolate();
-    data->stopped = false;
     if (!info[0]->IsFunction()) {
         Nan::ThrowError("Argument must be a function");
         return;
@@ -325,7 +339,13 @@ NAN_METHOD(Open) {
     data->context.Reset(Nan::GetCurrentContext());
     data->callback.Reset(v8::Local<v8::Function>::Cast(info[0]));
 
-    if (FLAC__stream_decoder_init_stream(&data->decoder,
+    data->decoder = FLAC__stream_decoder_new();
+    if (data->decoder == nullptr) {
+        Nan::ThrowError("Unable to create decoder");
+        return;
+    }
+
+    if (FLAC__stream_decoder_init_stream(data->decoder,
                                          data->readCallback,
                                          nullptr,
                                          nullptr,
@@ -334,37 +354,37 @@ NAN_METHOD(Open) {
                                          data->writeCallback,
                                          data->metadataCallback,
                                          data->errorCallback,
-                                         &data) != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
+                                         data) != FLAC__STREAM_DECODER_INIT_STATUS_OK) {
         Nan::ThrowError("Failed to initialize flac stream");
         return;
     }
 
     if (uv_async_init(uv_default_loop(), &data->async, data->asyncCallback) < 0) {
-        FLAC__stream_decoder_finish(&data->decoder);
-        FLAC__stream_decoder_delete(&data->decoder);
+        FLAC__stream_decoder_finish(data->decoder);
+        FLAC__stream_decoder_delete(data->decoder);
         Nan::ThrowError("Failed to init async handle");
         return;
     }
     data->async.data = data;
 
     if (uv_mutex_init(&data->mutex) < 0) {
-        FLAC__stream_decoder_finish(&data->decoder);
-        FLAC__stream_decoder_delete(&data->decoder);
+        FLAC__stream_decoder_finish(data->decoder);
+        FLAC__stream_decoder_delete(data->decoder);
         Nan::ThrowError("Failed to init mutex");
         return;
     }
 
     if (uv_cond_init(&data->cond) < 0) {
-        FLAC__stream_decoder_finish(&data->decoder);
-        FLAC__stream_decoder_delete(&data->decoder);
+        FLAC__stream_decoder_finish(data->decoder);
+        FLAC__stream_decoder_delete(data->decoder);
         uv_mutex_destroy(&data->mutex);
         Nan::ThrowError("Failed to init mutex");
         return;
     }
 
-    if (uv_thread_create(&data->thread, data->flacThread, &data) < 0) {
-        FLAC__stream_decoder_finish(&data->decoder);
-        FLAC__stream_decoder_delete(&data->decoder);
+    if (uv_thread_create(&data->thread, data->flacThread, data) < 0) {
+        FLAC__stream_decoder_finish(data->decoder);
+        FLAC__stream_decoder_delete(data->decoder);
         uv_cond_destroy(&data->cond);
         uv_mutex_destroy(&data->mutex);
         Nan::ThrowError("Failed to init thread");
@@ -424,18 +444,25 @@ NAN_METHOD(Feed) {
     v8::Local<v8::Value> extValue = obj->GetPrivate(ctx, extName).ToLocalChecked();
     Data* data = static_cast<Data*>(v8::Local<v8::External>::Cast(extValue)->Value());
 
-    if (!node::Buffer::HasInstance(info[0])) {
+    if (!node::Buffer::HasInstance(info[1])) {
         Nan::ThrowError("Feed needs a Buffer argument");
         return;
     }
 
-    const char* dt = node::Buffer::Data(info[0]);
-    const size_t size = node::Buffer::Length(info[0]);
+    const char* dt = node::Buffer::Data(info[1]);
+    const size_t size = node::Buffer::Length(info[1]);
+
+    if (!size)
+        return;
+
+    // printf("feeding %zu\n", size);
 
     uv_mutex_lock(&data->mutex);
-    data->inbuffers.push_back(std::string(dt, size));
+    data->inbuffers.push_back(Data::BufferData{ 0, std::string(dt, size) });
     uv_cond_signal(&data->cond);
     uv_mutex_unlock(&data->mutex);
+
+    // printf("fed\n");
 }
 
 NAN_MODULE_INIT(Initialize) {
