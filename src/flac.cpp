@@ -15,6 +15,7 @@ constexpr auto to_underlying(E e) noexcept
 struct Data
 {
     Data();
+    ~Data();
 
     static uint32_t openCount;
     static Nan::Persistent<v8::Private> extName;
@@ -85,6 +86,15 @@ Data::Data()
     : stopped(false), needsDone(false), decoder(nullptr)
 {
     memset(&currentFormat, '\0', sizeof(currentFormat));
+
+    uv_mutex_init(&mutex);
+    uv_cond_init(&cond);
+}
+
+Data::~Data()
+{
+    uv_cond_destroy(&cond);
+    uv_mutex_destroy(&mutex);
 }
 
 inline bool Data::formatChanged(const FLAC__Frame* frame) const
@@ -267,8 +277,6 @@ void Data::close()
 
     FLAC__stream_decoder_finish(decoder);
     FLAC__stream_decoder_delete(decoder);
-    uv_cond_destroy(&cond);
-    uv_mutex_destroy(&mutex);
 
     decoder = nullptr;
 }
@@ -384,21 +392,6 @@ NAN_METHOD(Open) {
         return;
     }
     data->async.data = data;
-
-    if (uv_mutex_init(&data->mutex) < 0) {
-        FLAC__stream_decoder_finish(data->decoder);
-        FLAC__stream_decoder_delete(data->decoder);
-        Nan::ThrowError("Failed to init mutex");
-        return;
-    }
-
-    if (uv_cond_init(&data->cond) < 0) {
-        FLAC__stream_decoder_finish(data->decoder);
-        FLAC__stream_decoder_delete(data->decoder);
-        uv_mutex_destroy(&data->mutex);
-        Nan::ThrowError("Failed to init mutex");
-        return;
-    }
 
     if (uv_thread_create(&data->thread, data->flacThread, data) < 0) {
         FLAC__stream_decoder_finish(data->decoder);
