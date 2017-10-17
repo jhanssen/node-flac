@@ -1,4 +1,4 @@
-/*global require,process*/
+/*global require,process,setTimeout*/
 
 const { FlacDecoder } = require("..");
 const { createReadStream } = require("fs");
@@ -7,8 +7,19 @@ const Speaker = require("speaker");
 
 //console.log(FlacDecoder);
 
+function wrapSpeaker(speaker) {
+    speaker.removeListener('finish', speaker._flush);
+    speaker._flush = () => {
+        speaker.emit('flush');
+        setTimeout(() => {
+            speaker.close(true);
+        }, 500);
+    };
+    speaker.on('finish', speaker._flush);
+    return speaker;
+}
+
 createReadStream("/tmp/test.flac")
-    .on("end", () => { console.log("file end."); })
     .pipe(new FlacDecoder)
     .on("format", console.log)
-    .pipe(new Speaker);
+    .pipe(wrapSpeaker(new Speaker));
