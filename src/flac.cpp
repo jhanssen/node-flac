@@ -202,7 +202,7 @@ FLAC__StreamDecoderWriteStatus Data::writeCallback(const FLAC__StreamDecoder *de
     // printf("wrote %u (%u)\n", frameSamples, ptr - reinterpret_cast<unsigned char*>(&dt[0]));
 
     if (!dt.empty()) {
-        data->messages.push_back(Message{ Message::Type::Data, dt });
+        data->messages.push_back(Message{ Message::Type::Data, std::move(dt) });
         uv_async_send(&data->async);
     }
 
