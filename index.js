@@ -33,6 +33,9 @@ class FlacDecoder extends Transform {
                 this._transformCb = undefined;
                 done();
                 break;
+            case Types.End:
+                this._flac = undefined;
+                break;
             }
         });
     }

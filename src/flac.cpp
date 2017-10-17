@@ -19,7 +19,7 @@ struct Data
     static uint32_t openCount;
     static Nan::Persistent<v8::Private> extName;
 
-    bool stopped, needsDone, end;
+    bool stopped, needsDone;
     Nan::Persistent<v8::Context> context;
     Nan::Persistent<v8::Function> callback;
     Nan::Persistent<v8::Object> weak;
@@ -52,7 +52,7 @@ struct Data
 
     struct Message
     {
-        enum class Type { Format, Metadata, Data, Done };
+        enum class Type { Format, Metadata, Data, Done, End };
 
         Type type;
         std::variant<Format, Metadata, std::string> data;
@@ -82,7 +82,7 @@ uint32_t Data::openCount = 0;
 Nan::Persistent<v8::Private> Data::extName;
 
 Data::Data()
-    : stopped(false), needsDone(false), end(false), decoder(nullptr)
+    : stopped(false), needsDone(false), decoder(nullptr)
 {
     memset(&currentFormat, '\0', sizeof(currentFormat));
 }
@@ -110,6 +110,7 @@ FLAC__StreamDecoderReadStatus Data::readCallback(const FLAC__StreamDecoder */*de
     while (!data->stopped && data->inbuffers.empty()) {
         // if we need more data, wait
         if (data->needsDone) {
+            data->needsDone = false;
             data->messages.push_back(Message{ Message::Type::Done, std::string() });
             uv_async_send(&data->async);
         }
@@ -230,6 +231,16 @@ void Data::flacThread(void* arg)
 
         if (data->stopped)
             break;
+        if (FLAC__stream_decoder_get_state(data->decoder) == FLAC__STREAM_DECODER_END_OF_STREAM) {
+            // end of stream, send a done if we haven't and close the decoder
+            if (data->needsDone) {
+                data->needsDone = false;
+                data->messages.push_back(Message{ Message::Type::Done, std::string() });
+            }
+            data->messages.push_back(Message{ Message::Type::End, std::string() });
+            uv_async_send(&data->async);
+            break;
+        }
     }
     uv_mutex_unlock(&data->mutex);
 }
@@ -324,6 +335,13 @@ void Data::asyncCallback(uv_async_t* handle)
         case Data::Message::Type::Done: {
             v8::Local<v8::Value> done = v8::Integer::New(data->isolate, to_underlying(message.type));
             callback->Call(context, callback, 1, &done);
+            break; }
+        case Data::Message::Type::End: {
+            // decoder end and thread dead. join and stuff.
+            data->close();
+
+            v8::Local<v8::Value> end = v8::Integer::New(data->isolate, to_underlying(message.type));
+            callback->Call(context, callback, 1, &end);
             break; }
         }
     }
@@ -443,6 +461,10 @@ NAN_METHOD(Feed) {
     }
     v8::Local<v8::Value> extValue = obj->GetPrivate(ctx, extName).ToLocalChecked();
     Data* data = static_cast<Data*>(v8::Local<v8::External>::Cast(extValue)->Value());
+    if (!data->decoder) {
+        Nan::ThrowError("Decoder not open");
+        return;
+    }
 
     if (!node::Buffer::HasInstance(info[1])) {
         Nan::ThrowError("Feed needs a Buffer argument");
