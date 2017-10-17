@@ -41,9 +41,8 @@ class FlacDecoder extends Transform {
     }
 
     _transform(chunk, encoding, done) {
-        console.log("want to transform", chunk.length, typeof done);
+        // console.log("want to transform", chunk.length, typeof done);
         this._transformCb = done;
-        // this._cnt += chunk.length;
         bindings.Feed(this._flac, chunk);
         //console.log("fed total", this._cnt);
     }
