@@ -86,6 +86,7 @@ Data::Data()
     : stopped(false), needsDone(false), decoder(nullptr)
 {
     memset(&currentFormat, '\0', sizeof(currentFormat));
+    memset(&async, '\0', sizeof(async));
 
     uv_mutex_init(&mutex);
     uv_cond_init(&cond);
@@ -295,7 +296,12 @@ void Data::weakCallback(const Nan::WeakCallbackInfo<Data> &data)
 {
     Data* param = data.GetParameter();
     param->close();
-    delete param;
+    if (param->async.data) {
+        uv_close(reinterpret_cast<uv_handle_t*>(&param->async),
+                 [](uv_handle_t* handle) { delete static_cast<Data*>(handle->data); });
+    } else {
+        delete param;
+    }
 }
 
 void Data::asyncCallback(uv_async_t* handle)
